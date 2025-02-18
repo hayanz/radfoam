@@ -10,14 +10,14 @@ from torchvision.transforms import ToTensor, Compose, Resize
 from .ray_utils import *
 
 from functools import cached_property
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 
 class Synthetic(Dataset):
     def __init__(
         self,
         datadir: str, split: str = "train", is_stack: bool = False, N_vis: int = -1,
-        img_size: List[int] = [800, 800], resize: float = 0.5,
+        img_size: List[int] = [800, 800], resize: float = 0.5, white_bkgd: bool = True,
     ):
         assert split in ["train", "val", "test"]
 
@@ -41,11 +41,24 @@ class Synthetic(Dataset):
         ])
 
         data = self.preprocess()
+        if white_bkgd:
+            data["rgbs"] = data["rgbs"][..., :-1] * data["rgbs"][..., -1:] + (1. - data["rgbs"][..., -1:])
+        else:
+            data["rgbs"] = data["rgbs"][..., :-1] * data["rgbs"][..., -1:]
+
+        self.all_rgbs = data["rgbs"]
+        self.all_poses = data["poses"]
+        self.all_rays = data["rays"]
+        self.cameras = data["cameras"]
+
+        if not self.is_stack:
+            self.all_rays = self.all_rays.reshape(-1, *self.all_rays.shape[-2:])
+            self.all_rgbs = self.all_rgbs.reshape(-1, *self.all_rgbs.shape[-2:])
 
         # XXX implement from here
 
     def preprocess(self) -> Dict[str, torch.Tensor]:
-        data = {"imgs": [], "poses": []}
+        data = {"imgs": [], "poses": [], "rays": [], "cameras": []}
         mode = "eval" if self.split == "val" else self.split
         pbar = tqdm(self.info["frames"], desc=f"[{mode}] Loading data...")
 
@@ -54,12 +67,28 @@ class Synthetic(Dataset):
             img = self.load_image(fname)
             pose = np.array(frame["transform_matrix"]).astype(np.float32)
             pose = torch.from_numpy(pose)
+            cam, rays = self.convert_rays(pose)
             data["imgs"].append(img)
             data["poses"].append(pose)
+            data["rays"].append(rays)
+            data["cameras"].append(cam.view(-1, 3)[0])
 
         data = {k: torch.stack(v) for k, v in data.items()}
 
         return data
+
+    def __getitem__(self, idx):
+        if self.split == "train":   # use data in the buffers
+            sample = {
+                "rays": self.all_rays[idx],
+                "rgbs": self.all_rgbs[idx],
+            }
+        else:                       # create data for each image separately
+            img = self.all_rgbs[idx]
+            rays = self.all_rays[idx]
+            sample = {"rays": rays, "rgbs": img}
+
+        return sample
 
     @cached_property
     def transform(self):
@@ -76,7 +105,7 @@ class Synthetic(Dataset):
 
         return img
 
-    def convert_rays(self, pose: torch.FloatTensor) -> torch.Tensor:
+    def convert_rays(self, pose: torch.FloatTensor) -> Tuple[torch.Tensor]:
         w_range, h_range = torch.arange(self.W), torch.arange(self.H)
         xs, ys = torch.meshgrid(w_range, h_range, indexing="xy")
 
@@ -84,5 +113,6 @@ class Synthetic(Dataset):
         dirs = torch.stack([(xs - self.W / 2) / self.F, -(ys - self.H / 2) / self.F, -torch.ones_like(xs)], dim=-1)
         rays_d = torch.sum(dirs[..., None, :] * pose[:3, :3], -1)   # [H, W, 3]
         rays_o = pose[:3, -1].expand(rays_d.shape)                  # [H, W, 3]
+        rays = torch.concat([rays_o, rays_d], dim=-1)               # [H, W, 6]
 
-        return torch.concat([rays_o, rays_d], dim=-1)               # [H, W, 6]
+        return rays_o, rays
